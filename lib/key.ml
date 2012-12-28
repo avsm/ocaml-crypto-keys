@@ -16,8 +16,10 @@
  *
  *)
 
+open Dns.Packet
 open Rsa
 open Lwt
+open Printf
 module C = Cryptokit
 
 exception Key_error of string
@@ -85,29 +87,50 @@ type key_conf = {
   mutable ns_port : int;
 }
 
-let process_dnskey_rr = 
-  let open Dns.Packet in
-  function
-  | DNSKEY(_, _, bits) -> (
-      bitmatch (Bitstring.bitstring_of_string bits) with 
-        | {0:8;len:16; exp:len*8:string; modu:-1:string} ->
-            Some({C.RSA.size = 0; C.RSA.n = modu;
-                  C.RSA.e = exp; C.RSA.d = "";
-                  C.RSA.p = ""; C.RSA.q = "";
-                  C.RSA.dp = ""; C.RSA.dq = "";
-                  C.RSA.qinv = "";})
-        | {len:8;exp:len*8:string; modu:-1:string} ->
-            Some({C.RSA.size = 0; C.RSA.n = modu;
-                  C.RSA.e = exp; C.RSA.d = "";
-                  C.RSA.p = ""; C.RSA.q = "";
-                  C.RSA.dp = ""; C.RSA.dq = "";
-                  C.RSA.qinv = "";})
-        | { _ } -> Printf.printf "Invalid RSA DNSKEY format\n%!"; None
-    )
+let process_dnskey_rr = function 
+  | DNSKEY(_, _, bits) -> 
+      let buf = Cstruct.of_bigarray (Lwt_bytes.of_string bits) in 
+      let (exp, modu) = 
+        match (Cstruct.get_uint8 buf 0) with
+          | 0 -> 
+              let len = Cstruct.BE.get_uint16 buf 1 in 
+              let buf = Cstruct.shift buf 3 in 
+              let e = Cstruct.to_string (Cstruct.sub buf 0 len) in 
+              let buf = Cstruct.shift buf len in 
+              let n = Cstruct.to_string buf in 
+                (e, n)
+          | len -> 
+              let buf = Cstruct.shift buf 1 in 
+              let e = Cstruct.to_string (Cstruct.sub buf 0 len) in 
+              let buf = Cstruct.shift buf len in 
+              let n = Cstruct.to_string buf in 
+                (e, n)
+      in
+        Some( C.RSA.({size = 0;n = modu;e = exp; 
+                      d = "";p = "";q = "";dp = "";
+                      dq = "";qinv = "";}))
   | _ -> None
 
+let marshal_rsa_key key = 
+  let ret = Cstruct.create 4096 in
+  let len = 
+    if (String.length key.C.RSA.e > 255) then
+      let _ = Cstruct.set_uint8 ret 0 0 in
+      let _ = Cstruct.BE.set_uint16 ret 1 (String.length key.C.RSA.e) in
+        3
+    else 
+      let _ = Cstruct.set_uint8 ret 0 (String.length key.C.RSA.e) in 
+        1
+  in
+  let buf = Cstruct.shift ret len in 
+  let _ = Cstruct.blit_from_string key.C.RSA.e 0 buf 0 (String.length key.C.RSA.e) in
+  let buf = Cstruct.shift buf (String.length key.C.RSA.e) in 
+  let _ = Cstruct.blit_from_string key.C.RSA.n 0 buf 0 (String.length key.C.RSA.n) in 
+  let len = len + (String.length key.C.RSA.e) + (String.length key.C.RSA.n) in 
+    Cstruct.to_string (Cstruct.sub ret 0 len)
+
 let dns_pub_of_rsa key =
-  let len = String.length key.C.RSA.e in 
+(*  let len = String.length key.C.RSA.e in 
   let key_rdata = 
     if (len <= 255) then 
       BITSTRING{len:8; (key.C.RSA.e):len*8:string; 
@@ -115,24 +138,44 @@ let dns_pub_of_rsa key =
     else 
       BITSTRING{0:8; len:16; (key.C.RSA.e):len*8:string; 
                               key.C.RSA.n:(String.length key.C.RSA.n)*8:string}
-  in
-    Printf.sprintf "DNSKEY 256 3 5 %s" (C.transform_string (C.Base64.encode_compact ()) 
-                                          (Bitstring.string_of_bitstring key_rdata))
+  in *)
+    sprintf "DNSKEY 256 3 5 %s" 
+      (C.transform_string (C.Base64.encode_compact ()) 
+         (marshal_rsa_key key))
 
+let dnskey_rdata_of_rsa flag alg key =
+(*  let len = String.length key.C.RSA.e in 
+  let key_rdata = 
+    if (len <= 255) then 
+      BITSTRING{len:8; (key.C.RSA.e):len*8:string; 
+                        key.C.RSA.n:(String.length key.C.RSA.n)*8:string}
+    else 
+      BITSTRING{0:8; len:16; (key.C.RSA.e):len*8:string; 
+                              key.C.RSA.n:(String.length key.C.RSA.n)*8:string}
+  in *)
+    Dns.Packet.DNSKEY(flag, alg, 
+         (marshal_rsa_key key))
 
-let get_dnssec_key ?server:(server="128.232.1.1") ?dns_port:(dns_port = 53) domain =
+let get_dnssec_key ?server:(server="128.232.1.1") 
+      ?dns_port:(dns_port = 53) domain =
   try_lwt begin
     let open Dns.Packet in
-    lwt reply = Dns_resolver.resolve server dns_port Q_IN Q_DNSKEY
+    lwt t = Dns_resolver.create 
+              ~config:(`Static([(server,dns_port)],[""])) () in 
+    lwt reply = Dns_resolver.resolve t Q_IN Q_DNSKEY
         (Dns.Name.string_to_domain_name domain) 
     in
-    match reply.answers with
-    |[] ->
-      Printf.printf "Failed to get \n%!";
-      return None
-    |ans::_ ->
-      let r = process_dnskey_rr ans.rdata in
-      return r
+    let rec find_dnskey_rec = function
+      | [] ->
+          let _ = Printf.printf "Failed to get \n%!" in 
+            return None
+      | ans::_ when (Dns.Packet.rdata_to_rr_type ans.rdata = Dns.Packet.RR_DNSKEY ) ->
+          let r = process_dnskey_rr ans.rdata in
+            return r
+      | _::ret -> 
+          find_dnskey_rec ret
+    in
+      find_dnskey_rec reply.answers 
   end
   with e ->
     Printf.printf "failed to resolve name : %s\n%!" (Printexc.to_string e);
@@ -154,45 +197,42 @@ let parse_dnssec_key file =
   let fd = open_in file in 
   let rec parse_file in_stream =
     try
-      let line = Re_str.split (Re_str.regexp ": ") (input_line in_stream) in 
+      let line = Re_str.split (Re_str.regexp ": ") 
+                   (input_line in_stream) in
+      let _ = 
         match line with
           (* TODO: Need to check if this is an RSA key *)
-          | "Modulus" :: value ->
-              n := decode_value (List.hd value); parse_file in_stream 
-          | "PublicExponent" :: value ->
-              e := decode_value (List.hd value); parse_file in_stream             
-          | "PrivateExponent" :: value ->
-              d := decode_value (List.hd value); parse_file in_stream             
-          | "Prime1" :: value ->
-              p := decode_value (List.hd value); parse_file in_stream             
-          | "Prime2" :: value ->
-              q := decode_value (List.hd value); parse_file in_stream             
-          | "Exponent1" :: value ->
-              dp := decode_value (List.hd value); parse_file in_stream             
-          | "Exponent2" :: value ->
-              dq:= decode_value (List.hd value); parse_file in_stream             
-          | "Coefficient" :: value ->
-              qinv := decode_value (List.hd value); parse_file in_stream             
-          | typ :: value ->
-              Printf.printf "read field:%s\n%!" typ; parse_file in_stream
-          | [] -> parse_file in_stream
+          | "Modulus" :: value -> n := decode_value (List.hd value) 
+          | "PublicExponent" :: value -> e := decode_value (List.hd value) 
+          | "PrivateExponent" :: value -> d := decode_value (List.hd value) 
+          | "Prime1" :: value -> p := decode_value (List.hd value) 
+          | "Prime2" :: value -> q := decode_value (List.hd value) 
+          | "Exponent1" :: value -> dp := decode_value (List.hd value) 
+          | "Exponent2" :: value -> dq:= decode_value (List.hd value) 
+          | "Coefficient" :: value -> qinv := decode_value (List.hd value)             
+          | typ :: value -> printf "read field:%s\n%!" typ
+          | [] -> ()
+      in 
+        parse_file in_stream
     with  End_of_file -> ()
   in
     parse_file fd;
-    C.RSA.({C.RSA.size = 0; C.RSA.n = !n; C.RSA.e = !e; C.RSA.d = !d;
-            C.RSA.p = !p; C.RSA.q = !q; C.RSA.dp = !dp; C.RSA.dq = !dq;
-            C.RSA.qinv = !qinv;})
+    C.RSA.({size=0;n=(!n);e=(!e);d=(!d);
+            p=(!p);q=(!q);dp=(!dp);dq=(!dq);
+            qinv=(!qinv);})
 
 let load_ssh_pub_key file =
-  let n_val = ref "" in 
-  let e_val = ref "" in 
+(*  let n_val = ref "" in 
+  let e_val = ref "" in *)
   let input = open_in file in 
   let buf = input_line input in
     close_in input;
     let key = (Cryptokit.(transform_string (Base64.decode ()) 
-                            (List.nth (Re_str.split (Re_str.regexp " ") buf) 1))) in 
+                            (List.nth (Re_str.split (Re_str.regexp " ") buf) 1))) in
+    let buf = 
+      Cstruct.of_bigarray (Lwt_bytes.of_string key) in
 (*       Printf.printf "readine key %s \n%!" (Rsa.hex_of_string key); *)
-      let _ = 
+(*      let _ = 
         bitmatch (Bitstring.bitstring_of_string key) with 
           | { "\x00\x00\x00\x07\x73\x73\x68\x2D\x72\x73\x61":88:string;
         ebytes:32; e:((Int32.to_int ebytes)*8):string;
@@ -201,8 +241,14 @@ let load_ssh_pub_key file =
               n_val := n; e_val := e;
 (*               Printf.printf "Matched the string"; *)
           | { _ } -> Printf.printf "Cannot decode key \n%!";
-      in
-        C.RSA.({C.RSA.size = 0; C.RSA.n =(!n_val); C.RSA.e =(!e_val); C.RSA.d ="";
+      in *)
+      let buf = Cstruct.shift buf 11 in 
+      let e_len = Int32.to_int (Cstruct.BE.get_uint32 buf 0) in 
+      let buf = Cstruct.shift buf 4 in 
+      let e = Cstruct.to_string (Cstruct.sub buf 0 e_len) in 
+      let buf = Cstruct.shift buf e_len in 
+      let n = Cstruct.to_string buf in 
+        C.RSA.({C.RSA.size = 0; C.RSA.n =n; C.RSA.e =e; C.RSA.d ="";
                 C.RSA.p =""; C.RSA.q =""; C.RSA.dp =""; C.RSA.dq ="";
                 C.RSA.qinv ="";})
 
@@ -219,15 +265,29 @@ let bitstring_ssh_pub_of_rsa key =
       else
         key.C.RSA.n 
     in
-    BITSTRING {
+    let buf = Cstruct.create 4096 in 
+    let data = buf in 
+    let _ = Cstruct.blit_from_string  "\x00\x00\x00\x07\x73\x73\x68\x2D\x72\x73\x61"
+              0 buf 0 11 in 
+    let buf = Cstruct.shift buf 11 in 
+    let _ = Cstruct.BE.set_uint32 buf 0 (Int32.of_int (String.length e)) in 
+    let buf = Cstruct.shift buf 4 in 
+    let _ = Cstruct.blit_from_string e 0 buf 0 (String.length e) in 
+    let buf = Cstruct.shift buf (String.length e) in 
+    let _ = Cstruct.BE.set_uint32 buf 0 (Int32.of_int (String.length n)) in 
+    let buf = Cstruct.shift buf 4 in 
+    let _ = Cstruct.blit_from_string n 0 buf 0 (String.length n) in 
+    let len = 11 + 8 + (String.length e) + (String.length n) in
+      Cstruct.sub data 0 len 
+(*    BITSTRING {
       "\x00\x00\x00\x07\x73\x73\x68\x2D\x72\x73\x61":88:string;
       (Int32.of_int (String.length e)):32; e:((String.length e)*8):string;
-      (Int32.of_int (String.length n)):32; n:((String.length n)*8):string }
+      (Int32.of_int (String.length n)):32; n:((String.length n)*8):string } *)
     
 let ssh_pub_key_of_rsa key =
  let key_bin =  bitstring_ssh_pub_of_rsa key in
     let key_ssh = (C.transform_string (C.Base64.encode_compact()) 
-      (Bitstring.string_of_bitstring key_bin)) in 
+      (Cstruct.to_string key_bin)) in 
       let ext_len = 
         if ( ((String.length key_ssh) mod 3) == 0) then 
           ""
@@ -239,7 +299,7 @@ let ssh_pub_key_of_rsa key =
 let ssh_fingerprint_of_rsa key = 
  let key_bin =  bitstring_ssh_pub_of_rsa key in
  let hash = C.hash_string (Cryptokit.Hash.md5 ()) 
-            (Bitstring.string_of_bitstring key_bin) in
+            (Cstruct.to_string key_bin) in
  let fingerprint = ref "" in 
    String.iter (fun ch -> 
                fingerprint := (Printf.sprintf "%s:%0x" (!fingerprint) 
@@ -248,7 +308,7 @@ let ssh_fingerprint_of_rsa key =
   (!fingerprint)
 
 let load_key server port file typ = 
-(*   Printf.printf "loading key %s (%s)\n%!" file (string_of_key_type typ); *)
+  Printf.printf "loading key %s (%s)\n%!" file (string_of_key_type typ); 
   match typ with 
     | PEM_PRIV -> 
         return(Some(Rsa.read_rsa_privkey file))
@@ -307,7 +367,10 @@ let sign_key conf =
                return(Rsa.sign_rsa_pub_key key sign_key conf.in_issuer 
                       conf.cert_subj conf.duration conf.out_key)
         end
-    | (_, _) -> failwith "Failed to read input key"
+    | (Some _ , None) -> 
+        failwith "Failed to read signing key"
+    | (None, Some _) -> 
+        failwith "Failed to read input key"
 
 let string_of_sign_key conf =
   Printf.printf "signing key...\n";
@@ -354,6 +417,21 @@ let dnskey_of_pem_pub_file file =
           return (Some([ret]))
     | None -> return (None)
 
+let dnskey_rdata_of_pem_pub_file file f a =
+  lwt tmp = load_key "" 0 file PEM_PUB in
+  match tmp with
+    | Some(key) -> 
+        return 
+          (Some(dnskey_rdata_of_rsa f a key))
+    | None -> return (None)
+let dnskey_rdata_of_pem_priv_file file f a =
+  lwt tmp = load_key "" 0 file PEM_PRIV in
+  match tmp with
+    | Some(key) -> 
+        return 
+          (Some(dnskey_rdata_of_rsa f a key))
+    | None -> return (None)
+
 let dnskey_of_pem_priv_file file =
   lwt tmp = load_key "" 0 file PEM_PRIV in
   match tmp with
@@ -382,3 +460,6 @@ let ssh_fingerprint_of_domain  ?server:(server="128.232.1.1")
 
 let create_rsa_key file len = 
   Rsa.create_rsa_key file len
+
+let load_rsa_priv_key file =
+  Rsa.read_rsa_privkey file

@@ -38,10 +38,15 @@ val process : key_conf -> unit Lwt.t
 val string_of_process : key_conf -> string Lwt.t
 
 val create_rsa_key : string -> int -> Cryptokit.RSA.key 
+val load_rsa_priv_key : string -> Cryptokit.RSA.key
 
 val ssh_fingerprint_of_domain: ?server:string -> ?port:int -> string -> 
         string list option Lwt.t
 val ssh_pub_key_of_domain : ?server:string -> ?port:int ->string -> 
         string list option Lwt.t
 val dnskey_of_pem_pub_file : string -> string list option Lwt.t
+val dnskey_rdata_of_pem_pub_file : string -> int -> Dns.Packet.dnssec_alg -> 
+  Dns.Packet.rdata option Lwt.t
+val dnskey_rdata_of_pem_priv_file : string -> int -> Dns.Packet.dnssec_alg -> 
+  Dns.Packet.rdata option Lwt.t
 val dnskey_of_pem_priv_file : string -> string list option Lwt.t
